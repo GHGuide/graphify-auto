@@ -1,11 +1,16 @@
 # Update strategy
 
+> **Correction (2026-06-25):** parts of this doc assumed per-file *semantic
+> re-extraction* costs tokens. Measurement ([FINDINGS.md](FINDINGS.md)) showed it
+> does **not** — code extraction and clustering are free; only community *naming*
+> costs tokens, and it's global + cosmetic. The layered model below is still
+> right; the only true "paid step" is naming. `decide_naming` implements the gate.
+
 How graphify-auto decides when to refresh a graph, and why that maximises token
 savings. The design rests on one fact:
 
 > **`graphify update` is AST-only. No LLM. Zero Claude tokens.**
-> Semantic re-extraction (re-reading changed content with an LLM) is the *only*
-> step that costs tokens.
+> The only token-costing step in the whole pipeline is community **naming**.
 
 So the strategy is not "be clever about updating." It's "run the free thing
 always, run the paid thing only when it pays off."

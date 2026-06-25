@@ -256,43 +256,58 @@ def clear_refreshed(project: Path, files: Iterable[str]) -> None:
     save_stale(project, load_stale(project) - set(files))
 
 
-# --- experimental scoped executor (GATED, default OFF) ----------------------
-# The only token-spending path. Requires graphify; builds a sub-graph for the
-# stale files and union-merges it into the main graph via `graphify merge-graphs`.
-# Marked experimental: merge dedup across node ids is not yet validated at scale.
-# TODO(graphify): a first-class `graphify reextract <files...> --merge` would
-# replace this and remove the merge-dedup risk.
+# --- the one paid step: community naming (see FINDINGS.md) ------------------
+# graphify keeps a graph QUERY-fresh for free (AST `update`). The only step that
+# costs LLM tokens is community *naming* (`cluster-only` with a backend). It is
+# global (not per-file) and cosmetic for querying. So the smart move is to gate
+# WHEN to re-name, never to re-extract per file. Per-file splice via merge-graphs
+# was removed: it namespaces ids and drops labels (FINDINGS.md).
 
-def execute_scoped_refresh(project: Path, files: list[str]) -> dict:  # pragma: no cover
-    import shutil, subprocess, tempfile
-    if not files:
-        return {"status": "noop"}
+NAME_STRUCT_DELTA = 0.05      # re-name only if >5% of nodes changed since last naming
+
+def _sig_path(project: Path) -> Path:
+    return _out(project) / ".name_signature.json"
+
+def _structure_signature(project: Path) -> dict:
+    g = _read_json(_graph_path(project), {})
+    return {"nodes": len(g.get("nodes", [])), "links": len(g.get("links", []))}
+
+def names_stale(project: Path) -> bool:
+    """True if community structure drifted materially since names were last set."""
+    last = _read_json(_sig_path(project), None)
+    if last is None:
+        return True                      # never named
+    cur = _structure_signature(project)
+    base = max(1, last.get("nodes", 0))
+    return abs(cur["nodes"] - last.get("nodes", 0)) / base > NAME_STRUCT_DELTA
+
+
+def decide_naming(project: Path, context: str = "manual") -> Plan:
+    """
+    Gate the only token-costing step. Worth re-naming only when ALL hold:
+      - a backend is configured (else naming is a no-op, 0 tokens), AND
+      - names are materially stale, AND
+      - context is one where named labels are about to matter
+        (idle | preview | session-end | manual), never on a hot per-edit path.
+    """
     if not cheap_backend_available():
-        return {"status": "skipped", "why": "no cheap backend; would spend host tokens"}
-    tmp = Path(tempfile.mkdtemp(prefix="gauto_"))
-    try:
-        for rel in files:
-            src = project / rel
-            if not src.exists():
-                continue
-            dst = tmp / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-        sub = subprocess.run(["graphify", "extract", str(tmp), "--no-cluster"],
-                             capture_output=True, text=True)
-        if sub.returncode != 0:
-            return {"status": "error", "stage": "extract", "stderr": sub.stderr[-500:]}
-        sub_graph = tmp / "graphify-out" / "graph.json"
-        if not sub_graph.exists():
-            return {"status": "error", "stage": "extract", "why": "no sub-graph produced"}
-        mg = subprocess.run(["graphify", "merge-graphs", str(_graph_path(project)), str(sub_graph),
-                             "--out", str(_graph_path(project))], capture_output=True, text=True)
-        if mg.returncode != 0:
-            return {"status": "error", "stage": "merge", "stderr": mg.stderr[-500:]}
-        clear_refreshed(project, files)
-        return {"status": "ok", "refreshed": len(files)}
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        return Plan(reason="no backend -> naming is a free no-op; placeholders fine for queries")
+    if context == "edit":
+        return Plan(reason="hot edit path -> defer naming (cosmetic, costs tokens)")
+    if not names_stale(project):
+        return Plan(reason="community structure ~unchanged since last naming -> skip")
+    return Plan(regen_viz=True, reason=f"names stale and context={context} -> re-name (cluster-only)")
+
+
+def run_naming(project: Path) -> dict:  # pragma: no cover - spends tokens iff backend set
+    """Execute the paid step. Safe no-op (0 tokens) when no backend; records sig."""
+    import subprocess
+    r = subprocess.run(["graphify", "cluster-only", str(project)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return {"status": "error", "stderr": r.stderr[-400:]}
+    _sig_path(project).write_text(json.dumps(_structure_signature(project)), encoding="utf-8")
+    return {"status": "ok", "named": cheap_backend_available()}
 
 
 # --- CLI --------------------------------------------------------------------
@@ -307,15 +322,16 @@ def _main() -> int:
     p = sub.add_parser("on-edit", help="plan after an edit batch")
     p.add_argument("project")
 
-    p = sub.add_parser("on-query", help="plan before answering a query")
+    p = sub.add_parser("decide-naming", help="gate the only paid step (community naming)")
+    p.add_argument("project")
+    p.add_argument("--context", default="manual",
+                   choices=["edit", "idle", "preview", "session-end", "manual"])
+
+    p = sub.add_parser("candidates", help="source files a query would touch (utility)")
     p.add_argument("project")
     p.add_argument("query")
 
-    p = sub.add_parser("candidates", help="show source files a query would touch")
-    p.add_argument("project")
-    p.add_argument("query")
-
-    p = sub.add_parser("status", help="show stale set + debt")
+    p = sub.add_parser("status", help="show stale set, debt, naming freshness")
     p.add_argument("project")
 
     args = ap.parse_args()
@@ -325,13 +341,14 @@ def _main() -> int:
         print(json.dumps(scan_stale(project), ensure_ascii=False))
     elif args.cmd == "on-edit":
         print(decide_on_edit(project).to_json())
-    elif args.cmd == "on-query":
-        print(decide_on_query(project, args.query).to_json())
+    elif args.cmd == "decide-naming":
+        print(decide_naming(project, args.context).to_json())
     elif args.cmd == "candidates":
         print(json.dumps(sorted(candidates_for_query(project, args.query)), ensure_ascii=False))
     elif args.cmd == "status":
         print(json.dumps({"stale": sorted(load_stale(project)), "debt": debt(project),
-                          "cheap_backend": cheap_backend_available()}, ensure_ascii=False))
+                          "cheap_backend": cheap_backend_available(),
+                          "names_stale": names_stale(project)}, ensure_ascii=False))
     return 0
 
 

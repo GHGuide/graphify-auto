@@ -9,20 +9,25 @@ process and without git hooks.
 
 ## The honest pitch
 
-graphify's incremental update (`graphify update`) is **AST-only — it uses no LLM,
-so it costs zero tokens**. That single fact drives everything here:
+Measured, not assumed (see [FINDINGS.md](FINDINGS.md)): almost everything graphify
+does to keep a graph **query-fresh costs zero tokens**.
 
-- **Structural refresh is free → so it's continuous.** Every time Claude edits a
-  file inside a built graph, the graph's code structure is refreshed. No budget
-  to manage, no decision to make.
-- **Semantic refresh costs tokens → so it's lazy.** Re-reading changed docs/logic
-  with an LLM is the only expensive part, so it happens *only when a query needs
-  it*, scoped to the files that query touches, and biased toward graphs you
-  actually use.
+- `graphify update` / `extract` (AST) — **free**, no backend.
+- re-clustering — **free**.
+- `query` — **free**, and works fine on an *unnamed* graph.
+- community **naming** — the *only* LLM/token step, and it's cosmetic for querying.
 
-That's the whole "smart" claim. It is not an AI deciding when to update — it's the
-observation that free things should run always and paid things should run only
-when they pay off. See [STRATEGY.md](STRATEGY.md) for the full model.
+So the design is small and honest:
+
+- **Keep graphs query-fresh continuously** — it's free, so just run `graphify
+  update` on every edit. (This is the whole win, and it already works.)
+- **Gate the one paid step (naming).** Never re-name communities per edit. Re-name
+  lazily, only when a backend is set *and* structure changed materially *and* the
+  named report is about to be used. With no backend it's a clean no-op.
+
+It is not an AI deciding when to update — it's the observation that graphify is
+already ~free to keep fresh, so the job is mostly *not wasting* tokens on naming.
+See [STRATEGY.md](STRATEGY.md) and [FINDINGS.md](FINDINGS.md).
 
 ## What's here
 
@@ -30,16 +35,15 @@ when they pay off. See [STRATEGY.md](STRATEGY.md) for the full model.
 |---|---|---|
 | `hooks/graphify-auto-update.sh` | PostToolUse hook: refresh graph on edit (free, AST) | working |
 | `hooks/graphify-flush.sh` | Stop hook: flush edited projects at turn end | working |
-| `policy/policy_engine.py` | Decides when a *semantic* (paid) rebuild is worth it | working planner |
+| `policy/policy_engine.py` | Token-free planner: staleness + naming gate | working |
+| `FINDINGS.md` | Measured token-cost map of graphify (corrects the design) | — |
 | `RESEARCH.md` | Literature grounding (IVM + query-driven extraction) | — |
 
-The two hooks are live and tested. The policy engine is a **working,
-token-free planner**: staleness via content-hash diff, query→file mapping from
-the graph's `source_file` nodes, and scoped `decide_on_query` plans — all tested
-end-to-end and verified on a real 10k-node graph (query→files in <0.1s). The one
-remaining piece is *executing* the paid re-extraction: `execute_scoped_refresh`
-is experimental (default OFF) and would be cleaner with a first-class
-`graphify reextract <files>` upstream.
+The two hooks are live and tested. The policy engine is a **working, token-free
+planner**: staleness via content-hash diff, query→file mapping from `source_file`
+nodes (verified on a real 10k-node graph, <0.1s), and `decide_naming` — the gate
+for the only paid step. Per-file `merge-graphs` splice was **removed** after
+testing showed it namespaces ids and drops labels (FINDINGS.md).
 
 ## Install (hooks only, today)
 
