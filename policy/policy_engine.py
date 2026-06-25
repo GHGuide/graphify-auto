@@ -327,6 +327,9 @@ def _main() -> int:
     p.add_argument("--context", default="manual",
                    choices=["edit", "idle", "preview", "session-end", "manual"])
 
+    p = sub.add_parser("run-naming", help="execute community naming (opt-in; costs tokens iff backend)")
+    p.add_argument("project")
+
     p = sub.add_parser("candidates", help="source files a query would touch (utility)")
     p.add_argument("project")
     p.add_argument("query")
@@ -343,6 +346,8 @@ def _main() -> int:
         print(decide_on_edit(project).to_json())
     elif args.cmd == "decide-naming":
         print(decide_naming(project, args.context).to_json())
+    elif args.cmd == "run-naming":
+        print(json.dumps(run_naming(project), ensure_ascii=False))
     elif args.cmd == "candidates":
         print(json.dumps(sorted(candidates_for_query(project, args.query)), ensure_ascii=False))
     elif args.cmd == "status":
