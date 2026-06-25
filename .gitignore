@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+graphify-out/
+.graphify_dirty
+.DS_Store
