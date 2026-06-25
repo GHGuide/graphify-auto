@@ -30,11 +30,16 @@ when they pay off. See [STRATEGY.md](STRATEGY.md) for the full model.
 |---|---|---|
 | `hooks/graphify-auto-update.sh` | PostToolUse hook: refresh graph on edit (free, AST) | working |
 | `hooks/graphify-flush.sh` | Stop hook: flush edited projects at turn end | working |
-| `policy/policy_engine.py` | Decides when a *semantic* (paid) rebuild is worth it | skeleton |
+| `policy/policy_engine.py` | Decides when a *semantic* (paid) rebuild is worth it | working planner |
+| `RESEARCH.md` | Literature grounding (IVM + query-driven extraction) | — |
 
-The two hooks are live and tested. The policy engine — the part that makes the
-"smart" claim true — is a skeleton with the decision logic stubbed against
-graphify's integration points.
+The two hooks are live and tested. The policy engine is a **working,
+token-free planner**: staleness via content-hash diff, query→file mapping from
+the graph's `source_file` nodes, and scoped `decide_on_query` plans — all tested
+end-to-end and verified on a real 10k-node graph (query→files in <0.1s). The one
+remaining piece is *executing* the paid re-extraction: `execute_scoped_refresh`
+is experimental (default OFF) and would be cleaner with a first-class
+`graphify reextract <files>` upstream.
 
 ## Install (hooks only, today)
 

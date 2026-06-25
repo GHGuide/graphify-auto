@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
-graphify-auto policy engine (SKELETON).
+graphify-auto policy engine.
 
-Decides when a *semantic* (token-costing) rebuild is worth it. The structural
-(AST) layer is free and handled by the shell hooks; nothing here gates that.
+Decides when a *semantic* (token-costing) rebuild is worth it, and which files
+to refresh. The structural (AST) layer is free and handled by the shell hooks;
+nothing here gates that.
 
-State lives under <project>/graphify-out/:
-  .semantic_stale.json   - files whose content changed since last LLM extraction
-  cost.json              - graphify's cost tracker (extended with query stats)
+Design is grounded in two literatures (see RESEARCH.md):
+  * Incremental View Maintenance — react to deltas, never recompute from scratch
+    (Kairo 2025; Partial Update, ICDE 2018; Stateful Differential Operators 2026).
+    -> we track a per-file stale set and refresh only deltas.
+  * Query-driven on-demand extraction — extract precisely where a query needs it,
+    guided by information gaps (AgenticOCR 2026; CAVIA 2025).
+    -> Trigger A re-extracts only the files behind a query's candidate nodes.
 
-Nothing in this file spends tokens. The only token cost is the actual
-`graphify` re-extraction call, which the `decide_*` functions return as a
-*plan* for the caller to execute. This keeps the policy pure and testable.
+Token-cost discipline: nothing in this module spends tokens. `scan_stale` only
+hashes files; `candidates_for_query` only reads graph.json. The expensive
+re-extraction is returned as a *Plan* for the caller to execute (and is gated).
 
-Integration points still owed by graphify are marked `# TODO(graphify)`.
+graphify graph.json is NetworkX node-link JSON:
+  nodes[] = {id, label, norm_label, source_file, source_location, file_type, ...}
+  links[] = {source, target, ...}   # source/target are node ids
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,34 +37,47 @@ from typing import Iterable
 # --- tunables ---------------------------------------------------------------
 
 WEIGHTS = {"struct": 1, "logic": 3, "prose": 5, "noop": 0}
-DEBT_THRESHOLD = 25          # background refresh only above this
-IDLE_MINUTES = 10            # viz regen after this much quiet
+DEBT_THRESHOLD = 25            # background (Trigger B) refresh only above this
+QUERY_TOP_K = 12               # candidate seed nodes per query
+EXPAND_HOPS = 1                # neighbourhood expansion around seeds
 CHEAP_BACKEND_ENV = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 
-CODE_EXT = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb", ".c", ".cpp", ".h"}
-PROSE_EXT = {".md", ".mdx", ".txt", ".rst", ".adoc"}
+CODE_EXT = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb",
+            ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".php", ".swift", ".kt"}
+PROSE_EXT = {".md", ".mdx", ".txt", ".rst", ".adoc", ".org"}
 
-# Heuristics for classifying a unified diff (token-free, regex only).
-_SIG_RE = re.compile(r"^[+-]\s*(def |class |func |fn |function |import |from |export )")
+_STOP = {"the", "a", "an", "of", "to", "in", "is", "and", "or", "how", "what",
+         "does", "do", "where", "which", "this", "that", "for", "with", "on",
+         "are", "be", "it", "use", "used", "using", "into", "from", "via"}
+
+_SIG_RE = re.compile(r"^[+-]\s*(def |class |func |fn |function |import |from |export |type |interface |struct )")
 _BODY_RE = re.compile(r"^[+-]")
 _WS_RE = re.compile(r"^[+-]\s*$")
 
 
-# --- state ------------------------------------------------------------------
+# --- paths / io -------------------------------------------------------------
+
+def _out(project: Path) -> Path:
+    return project / "graphify-out"
+
+def _graph_path(project: Path) -> Path:
+    return _out(project) / "graph.json"
 
 def _stale_path(project: Path) -> Path:
-    return project / "graphify-out" / ".semantic_stale.json"
+    return _out(project) / ".semantic_stale.json"
 
+def _hash_path(project: Path) -> Path:
+    return _out(project) / ".semantic_hashes.json"
+
+
+def _read_json(p: Path, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
 
 def load_stale(project: Path) -> set[str]:
-    p = _stale_path(project)
-    if not p.exists():
-        return set()
-    try:
-        return set(json.loads(p.read_text(encoding="utf-8")))
-    except Exception:
-        return set()
-
+    return set(_read_json(_stale_path(project), []))
 
 def save_stale(project: Path, stale: Iterable[str]) -> None:
     p = _stale_path(project)
@@ -64,29 +85,132 @@ def save_stale(project: Path, stale: Iterable[str]) -> None:
     p.write_text(json.dumps(sorted(set(stale)), ensure_ascii=False), encoding="utf-8")
 
 
-# --- classification ---------------------------------------------------------
+# --- staleness via content hashing (no tokens) ------------------------------
 
-def classify_diff(path: str, diff: str | None) -> str:
-    """Return one of: struct | logic | prose | noop. No tokens."""
+def _file_hash(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def graph_source_files(project: Path) -> set[str]:
+    """All source files referenced by graph nodes (relative paths as stored)."""
+    g = _read_json(_graph_path(project), {})
+    out = set()
+    for n in g.get("nodes", []):
+        sf = n.get("source_file")
+        if sf:
+            out.add(sf)
+    return out
+
+
+def scan_stale(project: Path) -> dict:
+    """
+    Hash every source file in the graph, diff against the stored hashes, and add
+    changed/new files to the stale set. Pure IVM delta detection — no LLM.
+    Returns a small report dict.
+    """
+    baseline = not _hash_path(project).exists()   # first scan: graph already reflects these files
+    prev = _read_json(_hash_path(project), {})
+    cur: dict[str, str] = {}
+    changed: list[str] = []
+    for rel in sorted(graph_source_files(project)):
+        h = _file_hash(project / rel)
+        if h is None:
+            continue                      # deleted/unreadable -> skip (AST pass handles removal)
+        cur[rel] = h
+        if not baseline and prev.get(rel) != h:
+            changed.append(rel)
+
+    stale = load_stale(project)
+    stale.update(changed)
+    save_stale(project, stale)
+    _hash_path(project).write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+    return {"scanned": len(cur), "changed": len(changed), "baseline": baseline,
+            "stale_total": len(stale), "changed_files": changed[:50]}
+
+
+# --- change classification (no tokens) --------------------------------------
+
+def classify(path: str, diff: str | None = None) -> str:
+    """struct | logic | prose | noop. AST already captures 'struct' for free."""
     ext = Path(path).suffix.lower()
     if ext in PROSE_EXT:
         return "prose"
     if diff is None:
-        # No diff available: assume body-logic change for code, prose otherwise.
         return "logic" if ext in CODE_EXT else "prose"
-    changed = [ln for ln in diff.splitlines() if _BODY_RE.match(ln) and not ln.startswith(("+++", "---"))]
-    if not changed:
+    lines = [ln for ln in diff.splitlines()
+             if _BODY_RE.match(ln) and not ln.startswith(("+++", "---"))]
+    if not lines or all(_WS_RE.match(ln) for ln in lines):
         return "noop"
-    if all(_WS_RE.match(ln) for ln in changed):
-        return "noop"
-    if any(_SIG_RE.match(ln) for ln in changed):
-        return "struct"     # AST will catch signature/import changes for free
+    if any(_SIG_RE.match(ln) for ln in lines):
+        return "struct"
     return "logic"
 
 
-def debt(project: Path, classes: dict[str, str]) -> int:
-    """classes: {file_path: class}. Sum of weights over current stale set."""
-    return sum(WEIGHTS.get(c, 0) for c in classes.values())
+def debt(project: Path) -> int:
+    """Weighted churn over the current stale set (file ext as a cheap proxy)."""
+    return sum(WEIGHTS[classify(f)] for f in load_stale(project))
+
+
+# --- query -> candidate files (no tokens) -----------------------------------
+
+def _tokens(q: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9]+", q.lower()) if len(t) > 2 and t not in _STOP]
+
+
+def candidates_for_query(project: Path, query: str,
+                         top_k: int = QUERY_TOP_K, hops: int = EXPAND_HOPS) -> set[str]:
+    """
+    Source files behind the nodes a query would most likely traverse. Seeds by
+    term overlap on node labels, expands `hops` over `links`, returns source_file
+    of the selected nodes. Mirrors graphify's own traversal closely enough to
+    bound what a scoped refresh must touch, without invoking the LLM.
+    """
+    g = _read_json(_graph_path(project), {})
+    nodes = g.get("nodes", [])
+    if not nodes:
+        return set()
+    by_id = {n.get("id"): n for n in nodes}
+    toks = _tokens(query)
+    if not toks:
+        return set()
+
+    def score(n) -> int:
+        hay = f"{n.get('norm_label','')} {n.get('label','')} {n.get('source_file','')}".lower()
+        return sum(1 for t in toks if t in hay)
+
+    scored = sorted(((score(n), n.get("id")) for n in nodes), reverse=True)
+    seeds = [nid for s, nid in scored if s > 0][:top_k]
+    selected = set(seeds)
+
+    if hops > 0 and seeds:
+        adj: dict[str, set[str]] = {}
+        for ln in g.get("links", []):
+            s, t = ln.get("source"), ln.get("target")
+            if s is None or t is None:
+                continue
+            adj.setdefault(s, set()).add(t)
+            adj.setdefault(t, set()).add(s)
+        frontier = set(seeds)
+        for _ in range(hops):
+            nxt = set()
+            for nid in frontier:
+                nxt |= adj.get(nid, set())
+            selected |= nxt
+            frontier = nxt
+
+    files = set()
+    for nid in selected:
+        n = by_id.get(nid)
+        if n and n.get("source_file"):
+            files.add(n["source_file"])
+    return files
 
 
 # --- decisions (return PLANS, never execute) --------------------------------
@@ -95,9 +219,8 @@ def debt(project: Path, classes: dict[str, str]) -> int:
 class Plan:
     ast_refresh: bool = False
     regen_viz: bool = False
-    semantic_files: list[str] = field(default_factory=list)  # files to LLM re-extract
+    semantic_files: list[str] = field(default_factory=list)
     reason: str = ""
-
     def to_json(self) -> str:
         return json.dumps(self.__dict__, ensure_ascii=False)
 
@@ -106,73 +229,109 @@ def cheap_backend_available() -> bool:
     return any(os.environ.get(k) for k in CHEAP_BACKEND_ENV)
 
 
-def decide_on_edit(project: Path, changed: dict[str, str | None]) -> Plan:
-    """
-    changed: {file_path: unified_diff_or_None}. Called from the edit hook.
-    Always plans a free AST refresh; updates the stale set; only plans a
-    background semantic rebuild when debt is high AND tokens are cheap.
-    """
-    classes = {f: classify_diff(f, d) for f, d in changed.items()}
-    stale = load_stale(project)
-    for f, c in classes.items():
-        if c in ("logic", "prose"):     # AST can't capture these
-            stale.add(f)
-    save_stale(project, stale)
-
+def decide_on_edit(project: Path) -> Plan:
+    """Edit hook: free AST refresh always; background semantic only if debt high
+    AND a cheap backend is configured (else defer to query-time, Trigger A)."""
+    rep = scan_stale(project)
     plan = Plan(ast_refresh=True, reason="structural refresh (free)")
-    score = debt(project, {f: c for f, c in classes.items() if f in stale})
+    score = debt(project)
     if score >= DEBT_THRESHOLD and cheap_backend_available():
-        plan.semantic_files = sorted(stale)
-        plan.reason = f"debt {score} >= {DEBT_THRESHOLD} and cheap backend -> background semantic rebuild"
+        plan.semantic_files = sorted(load_stale(project))
+        plan.reason = (f"debt {score} >= {DEBT_THRESHOLD} and cheap backend "
+                       f"-> background scoped semantic rebuild ({rep['changed']} changed)")
     return plan
 
 
-def decide_on_query(project: Path, candidate_files: Iterable[str]) -> Plan:
-    """
-    candidate_files: source files behind the nodes a query would traverse.
-    # TODO(graphify): expose this mapping from `graphify query`.
-    Re-extract ONLY the queried files that are stale, then answer.
-    """
-    stale = load_stale(project)
-    dirty = sorted(set(candidate_files) & stale)
+def decide_on_query(project: Path, query: str) -> Plan:
+    """Trigger A: re-extract only the queried-and-stale files, then answer."""
+    cand = candidates_for_query(project, query)
+    dirty = sorted(cand & load_stale(project))
     if not dirty:
-        return Plan(reason="query region already fresh — no tokens spent")
+        return Plan(reason=f"query region fresh ({len(cand)} candidate files, 0 stale) — 0 tokens")
     return Plan(semantic_files=dirty,
-                reason=f"scoped refresh of {len(dirty)} queried+stale file(s)")
+                reason=f"scoped refresh of {len(dirty)}/{len(cand)} queried files (query-driven)")
 
 
 def clear_refreshed(project: Path, files: Iterable[str]) -> None:
-    """Call after a successful semantic re-extract to drop files from stale set."""
     save_stale(project, load_stale(project) - set(files))
 
 
-# --- CLI (for the hooks / skill to call) ------------------------------------
+# --- experimental scoped executor (GATED, default OFF) ----------------------
+# The only token-spending path. Requires graphify; builds a sub-graph for the
+# stale files and union-merges it into the main graph via `graphify merge-graphs`.
+# Marked experimental: merge dedup across node ids is not yet validated at scale.
+# TODO(graphify): a first-class `graphify reextract <files...> --merge` would
+# replace this and remove the merge-dedup risk.
+
+def execute_scoped_refresh(project: Path, files: list[str]) -> dict:  # pragma: no cover
+    import shutil, subprocess, tempfile
+    if not files:
+        return {"status": "noop"}
+    if not cheap_backend_available():
+        return {"status": "skipped", "why": "no cheap backend; would spend host tokens"}
+    tmp = Path(tempfile.mkdtemp(prefix="gauto_"))
+    try:
+        for rel in files:
+            src = project / rel
+            if not src.exists():
+                continue
+            dst = tmp / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        sub = subprocess.run(["graphify", "extract", str(tmp), "--no-cluster"],
+                             capture_output=True, text=True)
+        if sub.returncode != 0:
+            return {"status": "error", "stage": "extract", "stderr": sub.stderr[-500:]}
+        sub_graph = tmp / "graphify-out" / "graph.json"
+        if not sub_graph.exists():
+            return {"status": "error", "stage": "extract", "why": "no sub-graph produced"}
+        mg = subprocess.run(["graphify", "merge-graphs", str(_graph_path(project)), str(sub_graph),
+                             "--out", str(_graph_path(project))], capture_output=True, text=True)
+        if mg.returncode != 0:
+            return {"status": "error", "stage": "merge", "stderr": mg.stderr[-500:]}
+        clear_refreshed(project, files)
+        return {"status": "ok", "refreshed": len(files)}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --- CLI --------------------------------------------------------------------
 
 def _main() -> int:
-    ap = argparse.ArgumentParser(description="graphify-auto update policy")
+    ap = argparse.ArgumentParser(description="graphify-auto update policy (token-free planner)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    e = sub.add_parser("on-edit", help="plan after an edit")
-    e.add_argument("project")
-    e.add_argument("--file", action="append", default=[], help="changed file (repeatable)")
+    p = sub.add_parser("scan-stale", help="hash source files, update stale set")
+    p.add_argument("project")
 
-    q = sub.add_parser("on-query", help="plan before answering a query")
-    q.add_argument("project")
-    q.add_argument("--candidate", action="append", default=[], help="candidate source file (repeatable)")
+    p = sub.add_parser("on-edit", help="plan after an edit batch")
+    p.add_argument("project")
 
-    s = sub.add_parser("status", help="show stale set + debt")
-    s.add_argument("project")
+    p = sub.add_parser("on-query", help="plan before answering a query")
+    p.add_argument("project")
+    p.add_argument("query")
+
+    p = sub.add_parser("candidates", help="show source files a query would touch")
+    p.add_argument("project")
+    p.add_argument("query")
+
+    p = sub.add_parser("status", help="show stale set + debt")
+    p.add_argument("project")
 
     args = ap.parse_args()
     project = Path(args.project).resolve()
 
-    if args.cmd == "on-edit":
-        print(decide_on_edit(project, {f: None for f in args.file}).to_json())
+    if args.cmd == "scan-stale":
+        print(json.dumps(scan_stale(project), ensure_ascii=False))
+    elif args.cmd == "on-edit":
+        print(decide_on_edit(project).to_json())
     elif args.cmd == "on-query":
-        print(decide_on_query(project, args.candidate).to_json())
+        print(decide_on_query(project, args.query).to_json())
+    elif args.cmd == "candidates":
+        print(json.dumps(sorted(candidates_for_query(project, args.query)), ensure_ascii=False))
     elif args.cmd == "status":
-        stale = load_stale(project)
-        print(json.dumps({"stale_files": sorted(stale), "count": len(stale)}, ensure_ascii=False))
+        print(json.dumps({"stale": sorted(load_stale(project)), "debt": debt(project),
+                          "cheap_backend": cheap_backend_available()}, ensure_ascii=False))
     return 0
 
 
