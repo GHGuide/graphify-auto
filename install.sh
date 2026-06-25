@@ -1,42 +1,33 @@
 #!/usr/bin/env bash
 # graphify-auto installer.
-# Copies the hooks + policy engine into place and prints the settings.json
-# snippet to enable them. Idempotent. Spends 0 tokens; never auto-builds graphs.
+# Installs the /graphify-auto skill + the policy engine. Idempotent.
+# Skill-invoked model: nothing fires automatically — you run /graphify-auto when
+# you want a project's graph refreshed. Spends 0 tokens; never auto-builds graphs.
+#
+# (Optional always-on hooks also ship under hooks/ — see "Always-on mode" below.)
 
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOKS_DIR="$HOME/.claude/hooks"
 ENGINE_DIR="$HOME/.graphify-auto"
+SKILL_DIR="$HOME/.claude/skills/graphify-auto"
 
-mkdir -p "$HOOKS_DIR" "$ENGINE_DIR"
+mkdir -p "$ENGINE_DIR" "$SKILL_DIR"
 
-install -m 0755 "$SRC/hooks/graphify-auto-update.sh" "$HOOKS_DIR/graphify-auto-update.sh"
-install -m 0755 "$SRC/hooks/graphify-flush.sh"       "$HOOKS_DIR/graphify-flush.sh"
-install -m 0644 "$SRC/policy/policy_engine.py"       "$ENGINE_DIR/policy_engine.py"
+install -m 0644 "$SRC/policy/policy_engine.py" "$ENGINE_DIR/policy_engine.py"
+install -m 0644 "$SRC/skill/SKILL.md"          "$SKILL_DIR/SKILL.md"
 
 echo "Installed:"
-echo "  $HOOKS_DIR/graphify-auto-update.sh"
-echo "  $HOOKS_DIR/graphify-flush.sh"
 echo "  $ENGINE_DIR/policy_engine.py"
+echo "  $SKILL_DIR/SKILL.md   (skill: /graphify-auto)"
 echo
-echo "Add this to ~/.claude/settings.json (hooks block):"
-cat <<'JSON'
-{
-  "hooks": {
-    "PostToolUse": [
-      { "matcher": "Edit|Write|MultiEdit",
-        "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/graphify-auto-update.sh", "async": true }] }
-    ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/graphify-flush.sh", "async": true }] }
-    ]
-  }
-}
-JSON
+echo "Use it:"
+echo "  /graphify <path>        # build a graph once (costs tokens)"
+echo "  /graphify-auto <path>   # smart-refresh that graph anytime (free)"
+echo "  /graphify-auto status   # show stale files + naming freshness"
+echo "  /graphify-auto name     # also re-name communities (costs tokens; needs backend)"
 echo
-echo "Then build each project once by hand:  graphify .   (or /graphify . in Claude Code)"
-echo
-echo "Optional: community-name auto-refresh costs LLM tokens and is OFF by default."
-echo "Enable per-shell with a backend configured:"
-echo "  export GRAPHIFY_AUTO_NAME=1   (and e.g. GOOGLE_API_KEY=...)"
+echo "Always-on mode (optional): to refresh on every Claude edit instead of"
+echo "on /graphify-auto, install the hooks and register them in settings.json:"
+echo "  install -m 0755 $SRC/hooks/*.sh $HOME/.claude/hooks/"
+echo '  settings.json hooks: PostToolUse(Edit|Write|MultiEdit)->graphify-auto-update.sh, Stop->graphify-flush.sh'
