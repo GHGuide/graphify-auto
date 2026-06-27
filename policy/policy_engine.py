@@ -135,6 +135,43 @@ def scan_stale(project: Path) -> dict:
             "stale_total": len(stale), "changed_files": changed[:50]}
 
 
+def _current_hashes(project: Path) -> dict:
+    cur: dict[str, str] = {}
+    for rel in sorted(graph_source_files(project)):
+        h = _file_hash(project / rel)
+        if h is not None:
+            cur[rel] = h
+    return cur
+
+
+def compute_drift(project: Path) -> list[str]:
+    """Files whose content differs from the recorded baseline = graph is behind the
+    code. Read-only and LIVE (no persisted accumulating set), so it goes back to
+    empty the moment the graph is rebuilt/updated. This is what 'stale' means."""
+    base = _read_json(_hash_path(project), {})
+    if not base:
+        return []                                   # no baseline yet -> graph reflects files
+    cur = _current_hashes(project)
+    return sorted(rel for rel, h in cur.items() if base.get(rel) != h)
+
+
+def mark_fresh(project: Path) -> dict:
+    """Re-baseline: record current file hashes as 'the graph reflects these', and
+    drop the legacy stale set. Call right after a build or `graphify update`, so
+    drift returns to 0 and the nudge stops crying stale on a current graph."""
+    cur = _current_hashes(project)
+    hp = _hash_path(project)
+    hp.parent.mkdir(parents=True, exist_ok=True)
+    hp.write_text(json.dumps(cur, ensure_ascii=False), encoding="utf-8")
+    sp = _stale_path(project)
+    if sp.exists():
+        try:
+            sp.unlink()
+        except Exception:
+            pass
+    return {"baselined": len(cur)}
+
+
 # --- change classification (no tokens) --------------------------------------
 
 def classify(path: str, diff: str | None = None) -> str:
@@ -154,8 +191,8 @@ def classify(path: str, diff: str | None = None) -> str:
 
 
 def debt(project: Path) -> int:
-    """Weighted churn over the current stale set (file ext as a cheap proxy)."""
-    return sum(WEIGHTS[classify(f)] for f in load_stale(project))
+    """Weighted churn over files that drifted from the graph (live, file-ext proxy)."""
+    return sum(WEIGHTS[classify(f)] for f in compute_drift(project))
 
 
 # --- query -> candidate files (no tokens) -----------------------------------
@@ -302,7 +339,7 @@ def ensure_cheap(project: Path) -> dict:
                                "code-only subset."}
             return {"status": "error", "stage": "extract", "stderr": err[-400:]}
         run(["cluster-only", "."])          # free; placeholder names, keeps query happy
-        rep = scan_stale(project)           # baseline hashes
+        mark_fresh(project)                 # baseline = current; drift now 0
         n = len(graph_source_files(project))
         return {"status": "ok", "action": "built-free", "files": n,
                 "tokens": 0, "note": "AST-only build, no LLM"}
@@ -311,9 +348,10 @@ def ensure_cheap(project: Path) -> dict:
         return _GFAIL
     if r.returncode != 0:
         return {"status": "error", "stage": "update", "stderr": r.stderr[-400:]}
-    rep = scan_stale(project)
+    changed = len(compute_drift(project))   # how far the graph was behind, pre-rebaseline
+    mark_fresh(project)                     # graph now reflects code -> drift back to 0
     return {"status": "ok", "action": "refreshed-free",
-            "changed": rep.get("changed", 0), "tokens": 0}
+            "changed": changed, "tokens": 0}
 
 
 # --- the one paid step: community naming (see FINDINGS.md) ------------------
@@ -382,6 +420,9 @@ def _main() -> int:
     p = sub.add_parser("scan-stale", help="hash source files, update stale set")
     p.add_argument("project")
 
+    p = sub.add_parser("mark-fresh", help="re-baseline hashes (call after a build/update)")
+    p.add_argument("project")
+
     p = sub.add_parser("on-edit", help="plan after an edit batch")
     p.add_argument("project")
 
@@ -407,6 +448,8 @@ def _main() -> int:
         print(json.dumps(ensure_cheap(project), ensure_ascii=False))
     elif args.cmd == "scan-stale":
         print(json.dumps(scan_stale(project), ensure_ascii=False))
+    elif args.cmd == "mark-fresh":
+        print(json.dumps(mark_fresh(project), ensure_ascii=False))
     elif args.cmd == "on-edit":
         print(decide_on_edit(project).to_json())
     elif args.cmd == "decide-naming":
@@ -416,7 +459,8 @@ def _main() -> int:
     elif args.cmd == "candidates":
         print(json.dumps(sorted(candidates_for_query(project, args.query)), ensure_ascii=False))
     elif args.cmd == "status":
-        print(json.dumps({"stale": sorted(load_stale(project)), "debt": debt(project),
+        drift = compute_drift(project)
+        print(json.dumps({"stale": drift, "behind_by": len(drift), "debt": debt(project),
                           "cheap_backend": cheap_backend_available(),
                           "names_stale": names_stale(project)}, ensure_ascii=False))
     return 0

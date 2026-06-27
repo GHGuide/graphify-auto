@@ -37,7 +37,7 @@ See [STRATEGY.md](STRATEGY.md) and [FINDINGS.md](FINDINGS.md).
 | `skill/SKILL.md` | the `/graphify-auto` skill — on-demand free refresh | working |
 | `policy/policy_engine.py` | Token-free planner: staleness + naming gate | working |
 | `install.sh` | installs nudge + skill + engine | working |
-| `hooks/graphify-auto-update.sh`, `graphify-flush.sh` | optional always-on refresh (on every edit) | working |
+| `hooks/graphify-auto-update.sh`, `graphify-flush.sh` | **smart auto-refresh** (default): light update on code edits, full at turn-end | working |
 | `FINDINGS.md` | Measured token-cost map of graphify (corrects the design) | — |
 | `RESEARCH.md` | Literature grounding (IVM + query-driven extraction) | — |
 
@@ -82,8 +82,8 @@ need a backend — it says so cleanly instead of failing.)
 - **Skip it:** throwaway / hackathon / edit-only projects. Even a free build isn't
   worth maintaining if you never query it — and editing code doesn't use the graph.
 
-Primary model is **skill-invoked**: nothing fires automatically — you run
-`/graphify-auto` when you want a project refreshed. The policy engine is a
+After install, refresh is **automatic and smart** (see "How updating works"
+below); `/graphify-auto` remains for manual build/refresh. The policy engine is a
 **working, token-free planner**: staleness via content-hash diff, query→file
 mapping from `source_file` nodes (verified on a real 10k-node graph, <0.1s), and
 `decide_naming` — the gate for the only paid step. Per-file `merge-graphs` splice
@@ -108,10 +108,30 @@ demand, install `hooks/*.sh` to `~/.claude/hooks/` and register them in
 `settings.json` (PostToolUse `Edit|Write|MultiEdit` → `graphify-auto-update.sh`,
 Stop → `graphify-flush.sh`). `install.sh` prints the exact lines.
 
+## How updating works (smart + automatic)
+
+After `install.sh`, refresh is automatic — you don't run anything. It updates only
+when it's worth it:
+
+- **When (smart gating):** a PostToolUse hook fires only on a **code** edit (skips
+  docs/json/etc — AST update can't use them), **inside a built graph**, and
+  **debounced 90s** so edit bursts don't stack rebuilds.
+- **How (cheap, no disk churn):** per-edit it runs a **light** `graphify update
+  --no-cluster` (structure only, no `graph.html` regen — that's what filled the
+  disk before). A Stop hook then does **one full** `graphify update` per turn
+  (clustering + report) and re-baselines.
+- **Accurate staleness:** "stale" = files whose content differs from the graph's
+  baseline (`behind_by` in `status`). It's live — drops back to 0 the moment the
+  graph updates, so the query-nudge only warns when the graph is *genuinely*
+  behind the code, never spuriously.
+
+All of it is AST-only → **0 tokens**. `/graphify-auto` is still there for manual
+build/refresh.
+
 ## Limits (read before believing the marketing)
 
-- Skill model is **on-demand** — you must run `/graphify-auto`. (Always-on hooks
-  exist but see external-edit caveat below.)
+- Auto-refresh fires on **Claude's** edits only. External-editor edits are caught
+  at the next Claude edit or a manual `/graphify-auto` (or use `graphify --watch`).
 - Refresh covers **code structure** (AST). That's free and keeps queries
   accurate. Community **names** only refresh via `name` + a backend.
 - Convenience over capability: `graphify --watch` catches external-editor edits
