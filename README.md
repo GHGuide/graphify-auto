@@ -33,12 +33,26 @@ See [STRATEGY.md](STRATEGY.md) and [FINDINGS.md](FINDINGS.md).
 
 | Path | What it is | Status |
 |---|---|---|
-| `skill/SKILL.md` | the `/graphify-auto` skill — on-demand smart refresh | working |
+| `hooks/graphify-query-nudge.sh` | **the savings.** Reminds Claude to query the graph (not grep) when you ask a codebase question in a graphed project | working |
+| `skill/SKILL.md` | the `/graphify-auto` skill — on-demand free refresh | working |
 | `policy/policy_engine.py` | Token-free planner: staleness + naming gate | working |
-| `install.sh` | installs skill + engine | working |
-| `hooks/*.sh` | optional always-on mode (refresh on every edit) | working |
+| `install.sh` | installs nudge + skill + engine | working |
+| `hooks/graphify-auto-update.sh`, `graphify-flush.sh` | optional always-on refresh (on every edit) | working |
 | `FINDINGS.md` | Measured token-cost map of graphify (corrects the design) | — |
 | `RESEARCH.md` | Literature grounding (IVM + query-driven extraction) | — |
+
+### The insight that drives this
+A fresh graph **saves nothing on its own.** Measured it: across 4 of my repos the graph
+*could* cut 77–98% of tokens per question — but realized savings were **~0**, because in
+practice Claude (and I) just grep/read files and never query the graph. A graph nobody
+queries is pure cost.
+
+So the savings chain has three links, and only the first two were ever built:
+1. graph exists  →  `/graphify`
+2. graph stays fresh  →  `/graphify-auto` (free)
+3. **questions actually go through the graph**  →  `graphify-query-nudge.sh` ← this is the fix
+
+The nudge is the cheap, proactive reminder that closes link 3. Without it, 1 and 2 are theatre.
 
 Primary model is **skill-invoked**: nothing fires automatically — you run
 `/graphify-auto` when you want a project refreshed. The policy engine is a
