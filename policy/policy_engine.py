@@ -256,6 +256,66 @@ def clear_refreshed(project: Path, files: Iterable[str]) -> None:
     save_stale(project, load_stale(project) - set(files))
 
 
+# --- ensure: build-cheap-or-refresh (the /graphify-auto core) ---------------
+# Guarantees a queryable graph for `project` at ~0 tokens:
+#   - no graph yet  -> FREE AST build (graphify extract + cluster), backend env
+#     stripped so no LLM is ever called (community names stay "Community N";
+#     cosmetic — queries work fine). Build cost ~0 => net-positive from query #1.
+#   - graph exists  -> FREE AST update (changed files only) + stale bookkeeping.
+# Never spends Claude tokens. Naming (the only paid step) stays opt-in elsewhere.
+
+_BACKEND_KEYS = ("GOOGLE_API_KEY", "GEMINI_API_KEY", "OPENAI_API_KEY",
+                 "ANTHROPIC_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY")
+
+def _free_env() -> dict:
+    import os
+    env = {k: v for k, v in os.environ.items() if k not in _BACKEND_KEYS}
+    env["PATH"] = os.path.expanduser("~/.local/bin") + ":" + env.get("PATH", "")
+    env["GRAPHIFY_NO_LLM"] = "1"   # belt-and-suspenders if graphify honors it
+    return env
+
+def ensure_cheap(project: Path) -> dict:
+    import subprocess
+    if not project.is_dir():
+        return {"status": "error", "why": f"path not found: {project}"}
+    env = _free_env()
+    def run(args):
+        try:
+            return subprocess.run(["graphify", *args], cwd=str(project), env=env,
+                                  capture_output=True, text=True)
+        except FileNotFoundError:
+            return None   # graphify not on PATH
+    _GFAIL = {"status": "error", "why": "graphify CLI not found on PATH"}
+    if not _graph_path(project).exists():
+        r = run(["extract", "."])
+        if r is None:
+            return _GFAIL
+        if r.returncode != 0:
+            err = (r.stderr or "")
+            # Non-code corpora (docs/papers/images) intrinsically need an LLM to
+            # extract — can't AST-parse a PDF/image. Report cleanly, don't crash.
+            if "no LLM API key" in err or "need semantic extraction" in err:
+                return {"status": "needs_backend", "action": "skipped", "tokens": 0,
+                        "why": "this corpus has docs/papers/images that require an LLM "
+                               "to build; code-only projects build free. Set a backend "
+                               "key (e.g. GEMINI_API_KEY) and use /graphify, or graph a "
+                               "code-only subset."}
+            return {"status": "error", "stage": "extract", "stderr": err[-400:]}
+        run(["cluster-only", "."])          # free; placeholder names, keeps query happy
+        rep = scan_stale(project)           # baseline hashes
+        n = len(graph_source_files(project))
+        return {"status": "ok", "action": "built-free", "files": n,
+                "tokens": 0, "note": "AST-only build, no LLM"}
+    r = run(["update", "."])
+    if r is None:
+        return _GFAIL
+    if r.returncode != 0:
+        return {"status": "error", "stage": "update", "stderr": r.stderr[-400:]}
+    rep = scan_stale(project)
+    return {"status": "ok", "action": "refreshed-free",
+            "changed": rep.get("changed", 0), "tokens": 0}
+
+
 # --- the one paid step: community naming (see FINDINGS.md) ------------------
 # graphify keeps a graph QUERY-fresh for free (AST `update`). The only step that
 # costs LLM tokens is community *naming* (`cluster-only` with a backend). It is
@@ -316,6 +376,9 @@ def _main() -> int:
     ap = argparse.ArgumentParser(description="graphify-auto update policy (token-free planner)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    p = sub.add_parser("ensure", help="build-free-if-missing or refresh-free; ~0 tokens")
+    p.add_argument("project")
+
     p = sub.add_parser("scan-stale", help="hash source files, update stale set")
     p.add_argument("project")
 
@@ -340,7 +403,9 @@ def _main() -> int:
     args = ap.parse_args()
     project = Path(args.project).resolve()
 
-    if args.cmd == "scan-stale":
+    if args.cmd == "ensure":
+        print(json.dumps(ensure_cheap(project), ensure_ascii=False))
+    elif args.cmd == "scan-stale":
         print(json.dumps(scan_stale(project), ensure_ascii=False))
     elif args.cmd == "on-edit":
         print(decide_on_edit(project).to_json())

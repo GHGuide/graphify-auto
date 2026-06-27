@@ -54,6 +54,34 @@ So the savings chain has three links, and only the first two were ever built:
 
 The nudge is the cheap, proactive reminder that closes link 3. Without it, 1 and 2 are theatre.
 
+### The economics fix: build free
+Link 1 used to cost **~150–360k tokens** (an LLM-backed build), so the graph only
+paid back after **~70 navigation queries** — which almost never happens. But that
+cost was optional: `graphify` builds **AST-only with no LLM** for code corpora, and
+the graph is still fully queryable (community names are just `Community N`
+placeholders — cosmetic).
+
+`/graphify-auto` now builds that way by default: it **strips backend keys** before
+building, so the build is guaranteed **~0 tokens**. Break-even drops from ~70
+queries to **1**. Every navigation query after that is pure profit.
+
+| | LLM build (old) | Free AST build (now) |
+|---|---|---|
+| Build cost | ~150–360k | **~0** |
+| Break-even | ~70 queries | **1 query** |
+| Queryable | yes | yes |
+| Community names | pretty | `Community N` (cosmetic) |
+
+So `/graphify-auto <project>` = build-free-if-missing **or** refresh-free, for any
+project, at ~0 tokens. (Docs/papers/image corpora can't be AST-parsed and still
+need a backend — it says so cleanly instead of failing.)
+
+### When it's actually worth graphing a project
+- **Worth it:** big, long-lived, navigation-heavy repos you ask many "how does X
+  work / where is Y" questions about.
+- **Skip it:** throwaway / hackathon / edit-only projects. Even a free build isn't
+  worth maintaining if you never query it — and editing code doesn't use the graph.
+
 Primary model is **skill-invoked**: nothing fires automatically — you run
 `/graphify-auto` when you want a project refreshed. The policy engine is a
 **working, token-free planner**: staleness via content-hash diff, query→file

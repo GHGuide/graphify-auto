@@ -1,64 +1,76 @@
 ---
 name: graphify-auto
-description: "On-demand smart refresh of a graphify knowledge graph. Use when the user types /graphify-auto, or asks to refresh/update/sync a graphify graph after edits without rebuilding from scratch. Runs the free AST update, tracks which files went stale, and gates the only token-costing step (community naming). Does NOT build graphs — use /graphify for that."
+description: "One command to make any project's graphify graph cheap and current. Use when the user types /graphify-auto, or asks to set up / refresh / sync a graphify graph for a project. Builds the graph FREE (AST-only, no LLM) if it doesn't exist, or refreshes it free if it does — then the query-nudge gets Claude to actually query it. Maximizes realized token savings at ~0 cost."
 ---
 
 # /graphify-auto
 
-On-demand, token-aware refresh for an already-built graphify graph. Replaces the
-old always-on edit hooks: nothing fires automatically — you run this when you
-want the current project's graph brought up to date.
+One command that makes any project's knowledge graph **cheap to build, current,
+and actually used**. For any project you point it at:
 
-Why it's cheap: `graphify update` (AST) is free; only community **naming** costs
-LLM tokens, so naming is opt-in. See the graphify-auto repo for FINDINGS/STRATEGY.
+- **No graph yet?** Builds it **free** — AST-only, no LLM call (`graphify extract`
+  with backend keys stripped). Community names are placeholders (cosmetic);
+  queries work fully. Build cost ~0 → net token-positive from the very first query.
+- **Graph exists?** Refreshes it **free** (incremental AST update) + tracks what
+  changed.
+
+Why free build matters: an LLM-backed build can cost ~150–360k tokens, so it only
+pays back after ~70 navigation queries. A **free** build pays back on query #1.
+
+The savings only become real if the graph is queried instead of grepped — that's
+the job of the installed `graphify-query-nudge` hook, which reminds Claude to
+`graphify query` on codebase questions inside a graphed project.
 
 ## Usage
 
 ```
-/graphify-auto              # smart-refresh the current directory's graph
-/graphify-auto <path>       # refresh the graph at <path>
+/graphify-auto              # build-if-missing (free) or refresh (free) the current dir
+/graphify-auto <path>       # same, for a specific project
 /graphify-auto status       # show stale files + naming freshness, change nothing
+/graphify-auto all          # refresh every built graph under the current dir (free)
 /graphify-auto name         # also re-run community naming (costs tokens; needs a backend)
 ```
 
 ## What to do when invoked
 
-Engine lives at `~/.graphify-auto/policy_engine.py` (installed by graphify-auto).
-All paths below assume `graphify` is on PATH (`export PATH="$HOME/.local/bin:$PATH"`).
+Engine: `~/.graphify-auto/policy_engine.py`. Assume `graphify` is on PATH
+(`export PATH="$HOME/.local/bin:$PATH"`).
 
-1. **Resolve the project root.** From the given path (or cwd), walk up to the
-   nearest ancestor containing `graphify-out/graph.json`.
-   - If none found: tell the user this folder has no graph yet and to run
-     `/graphify <path>` once first. **Do not build** — building costs tokens.
+1. **Resolve the target.** Use the given path, else cwd. (For `status`, walk up to
+   the nearest `graphify-out/graph.json`.)
 
-2. **`status` subcommand** → run only this, then report, stop:
+2. **`status`** → run only this, report, stop:
    ```
    python3 ~/.graphify-auto/policy_engine.py status <root>
    ```
 
-3. **Default / `name` refresh:**
+3. **`all`** → find and free-refresh every graph under cwd:
    ```
-   # free AST refresh (no tokens)
-   ( cd <root> && graphify update . )
-   # bookkeeping: which files changed since last refresh
-   python3 ~/.graphify-auto/policy_engine.py scan-stale <root>
-   # gate the paid step
-   python3 ~/.graphify-auto/policy_engine.py decide-naming <root> --context manual
+   find . -type d -name graphify-out -prune 2>/dev/null | while read d; do
+     python3 ~/.graphify-auto/policy_engine.py ensure "$(dirname "$d")"
+   done
    ```
 
-4. **Naming (only if user said `name`, or `GRAPHIFY_AUTO_NAME=1`):** if
-   `decide-naming` returned `"regen_viz": true` AND a backend key is set
-   (`GOOGLE_API_KEY`/`GEMINI_API_KEY`), run:
+4. **Default (build-or-refresh, FREE):**
    ```
-   python3 ~/.graphify-auto/policy_engine.py run-naming <root>
+   python3 ~/.graphify-auto/policy_engine.py ensure <root>
    ```
-   Otherwise tell the user naming was skipped and why (no backend / not stale).
+   - `"action":"built-free"` → first build, ~0 tokens.
+   - `"action":"refreshed-free"` → incremental update, ~0 tokens.
+   Report which happened, file/change counts, and that it cost 0 tokens.
 
-5. **Report** compactly: project root, nodes/links count, files refreshed,
-   stale set, naming decision, and tokens spent (0 unless naming actually ran).
+5. **`name` only** (opt-in, costs tokens, needs a backend): after `ensure`, run
+   `python3 ~/.graphify-auto/policy_engine.py run-naming <root>`. If no backend,
+   say it was skipped — names are cosmetic; queries don't need them.
+
+6. **Close the loop.** Remind the user (once) that for codebase questions they
+   should let Claude **query the graph** (`graphify query "..."`) rather than grep
+   — that's where the ~10–40× token savings actually land. The query-nudge hook
+   does this automatically inside graphed projects.
 
 ## Rules
-- Never auto-build a graph. Only refresh existing ones.
-- Naming is the only token-costing action — never run it without `name` or the
-  env opt-in.
-- Keep it to the resolved project; do not touch other graphs.
+- Builds and refreshes are **always free** — backend keys are stripped so no LLM
+  is ever called by this skill. Naming is the only paid step and is opt-in.
+- Be selective about *which* projects to graph: big, long-lived, navigation-heavy
+  repos pay off; throwaway / edit-only projects rarely do (free build helps, but
+  if you never query it, even a free graph isn't worth maintaining).
